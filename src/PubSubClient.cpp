@@ -255,12 +255,12 @@ boolean PubSubClient::connect(const char *id, const char *user, const char *pass
             lastInActivity = lastOutActivity = millis();
 
             while (!_client->available()) {
-                unsigned long t = millis();
-                if (t-lastInActivity >= ((int32_t) this->socketTimeout*1000UL)) {
+                if ((millis() - lastInActivity) >= (this->socketTimeout * 1000UL)) {
                     _state = MQTT_CONNECTION_TIMEOUT;
                     _client->stop();
                     return false;
                 }
+                vTaskDelay(100 / portTICK_PERIOD_MS);
             }
             uint8_t llen;
             uint32_t len = readPacket(&llen);
