@@ -431,10 +431,18 @@ uint32_t PubSubClient::readPacket(uint8_t *lengthLength)
     return len;
 }
 
+/**
+ * Главный цикл обработки. Теперь он сначала пытается отправить сообщение из очереди,
+ * а затем обрабатывает входящие данные.
+ */
 boolean PubSubClient::loop()
 {
     if (connected())
     {
+        // Отправить одно сообщение из очереди, если оно есть
+        sendFromQueue();
+
+        // Проверка keep-alive
         unsigned long t = millis();
         if ((t - lastInActivity > this->keepAlive * 1000UL) || (t - lastOutActivity > this->keepAlive * 1000UL))
         {
@@ -454,6 +462,8 @@ boolean PubSubClient::loop()
                 pingOutstanding = true;
             }
         }
+
+        // Обработка входящих данных
         if (_client->available())
         {
             uint8_t llen;
@@ -515,6 +525,86 @@ boolean PubSubClient::loop()
     return false;
 }
 
+/**
+ * Новая приватная функция для отправки одного сообщения из очереди.
+ * Возвращает true, если сообщение было отправлено.
+ */
+boolean PubSubClient::sendFromQueue()
+{
+    if (outgoingQueue.empty())
+    {
+        return false; // Очередь пуста, нечего отправлять
+    }
+
+    // Получаем сообщение из начала очереди, но пока не удаляем
+    auto &msg = outgoingQueue.front();
+
+    // Формируем и отправляем пакет в зависимости от типа сообщения
+    bool result = false;
+    switch (msg->type)
+    {
+    case MqttOutgoingPacketType::PUBLISH:
+    {
+        // Эта логика перенесена из старой функции publish()
+        if (this->bufferSize < MQTT_MAX_HEADER_SIZE + 2 + msg->topic.length() + msg->payload.size())
+        {
+            // Слишком длинное сообщение для буфера, удаляем его
+            outgoingQueue.pop();
+            return false;
+        }
+
+        uint16_t length = MQTT_MAX_HEADER_SIZE;
+        length = writeString(msg->topic.c_str(), this->buffer, length);
+
+        // Копируем данные из вектора
+        memcpy(this->buffer + length, msg->payload.data(), msg->payload.size());
+        length += msg->payload.size();
+
+        uint8_t header = MQTTPUBLISH;
+        if (msg->retained)
+        {
+            header |= 1;
+        }
+        result = write(header, this->buffer, length - MQTT_MAX_HEADER_SIZE);
+        break;
+    }
+    case MqttOutgoingPacketType::SUBSCRIBE:
+    {
+        // Эта логика перенесена из старой функции subscribe()
+        uint16_t length = MQTT_MAX_HEADER_SIZE;
+        nextMsgId++;
+        if (nextMsgId == 0)
+            nextMsgId = 1;
+        this->buffer[length++] = (nextMsgId >> 8);
+        this->buffer[length++] = (nextMsgId & 0xFF);
+        length = writeString(msg->topic.c_str(), this->buffer, length);
+        this->buffer[length++] = msg->qos;
+        result = write(MQTTSUBSCRIBE | MQTTQOS1, this->buffer, length - MQTT_MAX_HEADER_SIZE);
+        break;
+    }
+    case MqttOutgoingPacketType::UNSUBSCRIBE:
+    {
+        // Эта логика перенесена из старой функции unsubscribe()
+        uint16_t length = MQTT_MAX_HEADER_SIZE;
+        nextMsgId++;
+        if (nextMsgId == 0)
+            nextMsgId = 1;
+        this->buffer[length++] = (nextMsgId >> 8);
+        this->buffer[length++] = (nextMsgId & 0xFF);
+        length = writeString(msg->topic.c_str(), this->buffer, length);
+        result = write(MQTTUNSUBSCRIBE | MQTTQOS1, this->buffer, length - MQTT_MAX_HEADER_SIZE);
+        break;
+    }
+    }
+
+    // Если отправка прошла успешно, удаляем сообщение из очереди
+    if (result)
+    {
+        outgoingQueue.pop();
+    }
+    return result;
+}
+
 boolean PubSubClient::publish(const char *topic, const char *payload)
 {
     return publish(topic, (const uint8_t *)payload, payload ? strnlen(payload, this->bufferSize) : 0, false);
@@ -530,35 +620,19 @@ boolean PubSubClient::publish(const char *topic, const uint8_t *payload, unsigne
     return publish(topic, payload, plength, false);
 }
 
+/**
+ * ИЗМЕНЕННАЯ publish. Теперь она просто добавляет сообщение в очередь.
+ */
 boolean PubSubClient::publish(const char *topic, const uint8_t *payload, unsigned int plength, boolean retained)
 {
-    if (connected())
+    if (!connected() || !topic)
     {
-        if (this->bufferSize < MQTT_MAX_HEADER_SIZE + 2 + strnlen(topic, this->bufferSize) + plength)
-        {
-            // Too long
-            return false;
-        }
-        // Leave room in the buffer for header and variable length field
-        uint16_t length = MQTT_MAX_HEADER_SIZE;
-        length = writeString(topic, this->buffer, length);
-
-        // Add payload
-        uint16_t i;
-        for (i = 0; i < plength; i++)
-        {
-            this->buffer[length++] = payload[i];
-        }
-
-        // Write the header
-        uint8_t header = MQTTPUBLISH;
-        if (retained)
-        {
-            header |= 1;
-        }
-        return write(header, this->buffer, length - MQTT_MAX_HEADER_SIZE);
+        return false;
     }
-    return false;
+    // Создаем сообщение и перемещаем его в очередь
+    auto msg = std::make_unique<MqttOutgoingMessage>(topic, payload, plength, retained);
+    outgoingQueue.push(std::move(msg));
+    return true;
 }
 
 boolean PubSubClient::publish_P(const char *topic, const char *payload, boolean retained)
@@ -624,6 +698,11 @@ boolean PubSubClient::beginPublish(const char *topic, unsigned int plength, bool
 {
     if (connected())
     {
+        if (this->bufferSize < MQTT_MAX_HEADER_SIZE + 2 + strnlen(topic, this->bufferSize) + plength)
+        {
+            // Too long
+            return false;
+        }
         // Send the header and variable length field
         uint16_t length = MQTT_MAX_HEADER_SIZE;
         length = writeString(topic, this->buffer, length);
@@ -715,70 +794,43 @@ boolean PubSubClient::subscribe(const char *topic)
     return subscribe(topic, 0);
 }
 
+/**
+ * ИЗМЕНЕННАЯ subscribe. Теперь она просто добавляет сообщение в очередь.
+ */
 boolean PubSubClient::subscribe(const char *topic, uint8_t qos)
 {
-    size_t topicLength = strnlen(topic, this->bufferSize);
-    if (topic == 0)
+    if (!connected() || !topic || qos > 1)
     {
         return false;
     }
-    if (qos > 1)
-    {
-        return false;
-    }
-    if (this->bufferSize < 9 + topicLength)
-    {
-        // Too long
-        return false;
-    }
-    if (connected())
-    {
-        // Leave room in the buffer for header and variable length field
-        uint16_t length = MQTT_MAX_HEADER_SIZE;
-        nextMsgId++;
-        if (nextMsgId == 0)
-        {
-            nextMsgId = 1;
-        }
-        this->buffer[length++] = (nextMsgId >> 8);
-        this->buffer[length++] = (nextMsgId & 0xFF);
-        length = writeString((char *)topic, this->buffer, length);
-        this->buffer[length++] = qos;
-        return write(MQTTSUBSCRIBE | MQTTQOS1, this->buffer, length - MQTT_MAX_HEADER_SIZE);
-    }
-    return false;
+    auto msg = std::make_unique<MqttOutgoingMessage>(topic, qos);
+    outgoingQueue.push(std::move(msg));
+    return true;
 }
 
+/**
+ * ИЗМЕНЕННАЯ unsubscribe. Теперь она просто добавляет сообщение в очередь.
+ */
 boolean PubSubClient::unsubscribe(const char *topic)
 {
-    size_t topicLength = strnlen(topic, this->bufferSize);
-    if (topic == 0)
+    if (!connected() || !topic)
     {
         return false;
     }
-    if (this->bufferSize < 9 + topicLength)
-    {
-        // Too long
-        return false;
-    }
-    if (connected())
-    {
-        uint16_t length = MQTT_MAX_HEADER_SIZE;
-        nextMsgId++;
-        if (nextMsgId == 0)
-        {
-            nextMsgId = 1;
-        }
-        this->buffer[length++] = (nextMsgId >> 8);
-        this->buffer[length++] = (nextMsgId & 0xFF);
-        length = writeString(topic, this->buffer, length);
-        return write(MQTTUNSUBSCRIBE | MQTTQOS1, this->buffer, length - MQTT_MAX_HEADER_SIZE);
-    }
-    return false;
+    auto msg = std::make_unique<MqttOutgoingMessage>(topic);
+    outgoingQueue.push(std::move(msg));
+    return true;
 }
 
+/**
+ * ИЗМЕНЕННАЯ disconnect. Очищает очередь перед отключением.
+ */
 void PubSubClient::disconnect()
 {
+    // Очищаем очередь, чтобы не отправлять старые сообщения при следующем подключении
+    std::queue<std::unique_ptr<MqttOutgoingMessage>> empty;
+    std::swap(outgoingQueue, empty);
+
     this->buffer[0] = MQTTDISCONNECT;
     this->buffer[1] = 0;
     _client->write(this->buffer, 2);

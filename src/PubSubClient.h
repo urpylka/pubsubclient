@@ -11,6 +11,10 @@
 #include "IPAddress.h"
 #include "Client.h"
 #include "Stream.h"
+#include <string>
+#include <queue>
+#include <memory>
+#include <vector>
 
 #define MQTT_VERSION_3_1 3
 #define MQTT_VERSION_3_1_1 4
@@ -90,6 +94,37 @@
         return false;                                            \
     }
 
+// Типы пакетов, которые можно поместить в очередь
+enum class MqttOutgoingPacketType
+{
+    PUBLISH,
+    SUBSCRIBE,
+    UNSUBSCRIBE
+};
+
+// Структура для хранения данных исходящего сообщения
+// Копирует все данные, чтобы избежать проблем с временем жизни указателей
+struct MqttOutgoingMessage
+{
+    MqttOutgoingPacketType type;
+    std::string topic;
+    std::vector<uint8_t> payload;
+    uint8_t qos;
+    bool retained;
+
+    // Конструктор для PUBLISH
+    MqttOutgoingMessage(const char *t, const uint8_t *p, unsigned int p_len, bool r)
+        : type(MqttOutgoingPacketType::PUBLISH), topic(t), payload(p, p + p_len), qos(0), retained(r) {}
+
+    // Конструктор для SUBSCRIBE
+    MqttOutgoingMessage(const char *t, uint8_t q)
+        : type(MqttOutgoingPacketType::SUBSCRIBE), topic(t), qos(q), retained(false) {}
+
+    // Конструктор для UNSUBSCRIBE
+    MqttOutgoingMessage(const char *t)
+        : type(MqttOutgoingPacketType::UNSUBSCRIBE), topic(t), qos(0), retained(false) {}
+};
+
 class PubSubClient : public Print
 {
 private:
@@ -103,6 +138,10 @@ private:
     unsigned long lastInActivity;
     bool pingOutstanding;
     MQTT_CALLBACK_SIGNATURE;
+
+    std::queue<std::unique_ptr<MqttOutgoingMessage>> outgoingQueue;
+    boolean sendFromQueue();
+
     uint32_t readPacket(uint8_t *);
     boolean readByte(uint8_t *result);
     boolean readByte(uint8_t *result, uint16_t *index);
