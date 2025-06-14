@@ -16,7 +16,7 @@ PubSubClient::PubSubClient()
     this->buffer = NULL;
 
     this->bufferSize = 0;
-    this->incomingQueue = xQueueCreate(10, sizeof(MqttIncomingMessage));
+    this->incomingQueue = xQueueCreate(10, sizeof(MqttIncomingMessage *));
 
     // >> ИСПРАВЛЕНИЕ: Прямое присваивание вместо вызова сеттеров в конструкторе
     this->keepAlive = MQTT_KEEPALIVE;
@@ -115,13 +115,18 @@ boolean PubSubClient::loop()
                             payload = this->buffer + llen + 3 + topicLen;
                             payloadLen = len - llen - 3 - topicLen;
                         }
-                        MqttIncomingMessage msg;
-                        if (topicLen < sizeof(msg.topic))
+                        // 1. Создаем объект в КУЧЕ и получаем на него указатель
+                        auto *msg = new MqttIncomingMessage();
+
+                        // 2. Заполняем его данными, как и раньше
+                        if (topicLen < sizeof(msg->topic))
                         {
-                            strncpy(msg.topic, topic, topicLen);
-                            msg.topic[topicLen] = '\0';
+                            strncpy(msg->topic, topic, topicLen);
+                            msg->topic[topicLen] = '\0';
                         }
-                        msg.payload.assign(payload, payload + payloadLen);
+                        msg->payload.assign(payload, payload + payloadLen);
+
+                        // 3. Отправляем в очередь сам УКАЗАТЕЛЬ
                         xQueueSend(this->incomingQueue, &msg, (TickType_t)0);
                     }
                 }
