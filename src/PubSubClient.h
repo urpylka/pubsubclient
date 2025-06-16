@@ -2,7 +2,7 @@
   PubSubClient.h - A simple client for MQTT.
   Nick O'Leary
   http://knolleary.net
-  FINAL ARCHITECTURE v2: Corrected declarations.
+  FINAL ARCHITECTURE v3: Full QoS 1 support for outgoing messages.
 */
 
 #ifndef PubSubClient_h
@@ -14,6 +14,7 @@
 #include "Stream.h"
 #include <string>
 #include <queue>
+#include <list> // Используем list для in-flight сообщений
 #include <memory>
 #include <vector>
 
@@ -39,6 +40,11 @@
 // MQTT_SOCKET_TIMEOUT: socket timeout interval in Seconds. Override with setSocketTimeout()
 #ifndef MQTT_SOCKET_TIMEOUT
 #define MQTT_SOCKET_TIMEOUT 15
+#endif
+
+// Таймаут ожидания PUBACK перед повторной отправкой
+#ifndef MQTT_PUBLISH_TIMEOUT_S
+#define MQTT_PUBLISH_TIMEOUT_S 5
 #endif
 
 // MQTT_MAX_TRANSFER_SIZE : limit how much data is passed to the network client
@@ -78,7 +84,9 @@
 #define MQTTQOS1 (1 << 1)
 #define MQTTQOS2 (2 << 1)
 
-// Maximum size of fixed header and variable length size header
+// Флаг дубликата для QoS > 0
+#define MQTTDUP (1 << 3)
+
 #define MQTT_MAX_HEADER_SIZE 5
 
 #if defined(ESP32)
@@ -106,9 +114,8 @@ struct MqttOutgoingMessage
     uint8_t qos;
     bool retained;
 
-    // Конструктор для PUBLISH
-    MqttOutgoingMessage(const char *t, const uint8_t *p, unsigned int p_len, bool r)
-        : type(MqttOutgoingPacketType::PUBLISH), topic(t), payload(p, p + p_len), qos(0), retained(r) {}
+    MqttOutgoingMessage(const char *t, const uint8_t *p, unsigned int p_len, uint8_t q, bool r)
+        : type(MqttOutgoingPacketType::PUBLISH), topic(t), payload(p, p + p_len), qos(q), retained(r) {}
 
     // Конструктор для SUBSCRIBE
     MqttOutgoingMessage(const char *t, uint8_t q)
@@ -125,6 +132,13 @@ struct MqttIncomingMessage
     MqttIncomingMessage() { memset(topic, 0, sizeof(topic)); }
 };
 
+struct MqttInFlightMessage
+{
+    uint16_t packetId;
+    unsigned long timestamp;
+    std::unique_ptr<MqttOutgoingMessage> message;
+};
+
 class PubSubClient : public Print
 {
 private:
@@ -139,9 +153,12 @@ private:
     bool pingOutstanding;
 
     std::queue<std::unique_ptr<MqttOutgoingMessage>> outgoingQueue;
+    std::list<MqttInFlightMessage> inFlightMessages;
     QueueHandle_t incomingQueue;
 
     boolean sendFromQueue();
+    boolean resendPublish(MqttInFlightMessage &inFlightMsg);
+
     uint32_t readPacket(uint8_t *);
     boolean readByte(uint8_t *result);
     boolean readByte(uint8_t *result, uint16_t *index);
@@ -157,6 +174,8 @@ private:
     uint16_t port;
     Stream *stream;
     int _state;
+
+    void checkTimeouts();
 
 public:
     PubSubClient();
@@ -175,9 +194,10 @@ public:
 
     boolean connect(const char *id, const char *user = nullptr, const char *pass = nullptr, const char *willTopic = nullptr, uint8_t willQos = 0, boolean willRetain = false, const char *willMessage = nullptr, boolean cleanSession = true);
     void disconnect();
-    boolean publish(const char *topic, const char *payload, boolean retained = false);
-    boolean publish(const char *topic, const uint8_t *payload, unsigned int plength, boolean retained = false);
     // Write a single byte of payload (only to be used with beginPublish/endPublish)
+    boolean publish(const char *topic, const char *payload, uint8_t qos = 0, boolean retained = false);
+    boolean publish(const char *topic, const uint8_t *payload, unsigned int plength, uint8_t qos = 0, boolean retained = false);
+
     virtual size_t write(uint8_t);
     // Write size bytes from buffer into the payload (only to be used with beginPublish/endPublish)
     // Returns the number of bytes written
